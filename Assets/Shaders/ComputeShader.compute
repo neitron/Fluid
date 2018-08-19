@@ -1,0 +1,238 @@
+﻿#include "UnityCG.cginc"
+#include "Fluid.cginc"
+
+#define TRUE 1
+#define FALSE 0
+#define THREADC_COUNT_X 32
+
+
+RWStructuredBuffer<Particle> _ParticlesBufferIn;
+RWStructuredBuffer<Particle> _ParticlesBufferOut;
+
+float4 _PivotWorldPosition;
+
+float _CellSizeInverted;
+
+float t0 = -1;
+
+
+// ____________________________________KERNEL: 0____________________________________
+float rand(float u, float v)
+{
+	float f = dot(float2(12.9898, 78.233), float2(u, v));
+	return frac(43758.5453 * sin(f));
+}
+
+
+float3 randPoint(float id)
+{
+	float u = rand(id * 0.01334, 0.3728) * UNITY_PI * 2;
+	float z = rand(0.8372, id * 0.01197) * 2 - 1;
+	return float3(float2(cos(u), sin(u)) * sqrt(1 - z * z), z);
+}
+
+
+int calcHash(float3 pos)
+{
+	int x = floor(pos.x * _CellSizeInverted) * 73856093;
+	int y = floor(pos.y * _CellSizeInverted) * 19349663;
+	int z = floor(pos.z * _CellSizeInverted) * 83492791;
+	int hash = (x ^ y ^ z);
+	return hash;
+}
+
+
+#pragma kernel randomSphereInitPositions
+[numthreads(THREADC_COUNT_X,1,1)]
+void randomSphereInitPositions(uint3 id : SV_DispatchThreadID)
+{
+	float seed = floor(_Time.z + id.x * 0.1f) * 0.1f;
+	float3 newPos = randPoint(id.x + seed);
+	_ParticlesBufferIn[id.x].position = newPos;
+	_ParticlesBufferIn[id.x].hash = ((uint)_ParticlesCount * 0.5) - id.x;//calcHash(newPos); // 
+}
+
+
+// ____________________________________KERNEL: 1____________________________________
+#pragma kernel fluidBehaviour
+[numthreads(THREADC_COUNT_X, 1, 1)]
+void fluidBehaviour(uint3 id : SV_DispatchThreadID)
+{
+	if (t0 < 0.0f)
+	{
+		t0 = _Time.x;
+	}
+
+	float3 newPos;
+
+	float dg = -0.981f * (_Time.x - t0); // delta gravity
+
+	if ((_ParticlesBufferIn[id.x].position + _PivotWorldPosition).y > 0.015f)
+	{
+		newPos = _ParticlesBufferIn[id.x].position + float4(0.0f, dg, 0.0f, 0.0f);
+	}
+
+	if ((newPos + _PivotWorldPosition).y < 0.015f)
+	{
+		newPos.y = (float4(0.0f, 0.015f, 0.0f, 0.0f) - _PivotWorldPosition).y;
+	}
+
+	_ParticlesBufferIn[id.x].position = newPos;
+	_ParticlesBufferIn[id.x].hash = calcHash(newPos);
+}
+
+
+// ____________________________________KERNEL: 2____________________________________
+void trySwap(int id_a, int id_b)
+{
+	Particle a = _ParticlesBufferIn[id_a];
+	Particle b = _ParticlesBufferIn[id_b];
+
+	if (a.hash > b.hash)
+	{
+		_ParticlesBufferIn[id_a] = b;
+		_ParticlesBufferIn[id_b] = a;
+	}
+}
+
+
+
+// 0_1 2_3 4_5 6 ...
+#pragma kernel sortHashSetPass0
+[numthreads(THREADC_COUNT_X, 1, 1)]
+void sortHashSetPass0(uint3 id : SV_DispatchThreadID)
+{
+	int id_a = min(id.x * 2, _ParticlesCount - 1);
+	int id_b = min(id.x * 2 + 1, _ParticlesCount - 1);
+
+	trySwap(id_a, id_b);
+}
+
+
+
+// ____________________________________KERNEL: 3____________________________________
+// 0 1_2 3_4 5_6 ...
+#pragma kernel sortHashSetPass1
+[numthreads(THREADC_COUNT_X, 1, 1)]
+void sortHashSetPass1(uint3 id : SV_DispatchThreadID)
+{
+	int id_a = min(id.x * 2 + 1, _ParticlesCount - 1);
+	int id_b = min(id.x * 2 + 2, _ParticlesCount - 1);
+	
+	trySwap(id_a, id_b);
+}
+
+
+
+RWStructuredBuffer<uint> predicates;
+RWStructuredBuffer<uint> adressesOld;
+RWStructuredBuffer<uint> adresses;
+RWStructuredBuffer<uint> _Histogram;
+int significantBit;
+groupshared uint add = 0;
+// ____________________________________KERNEL: 4____________________________________
+void reduce(uint3 id, uint halfP)
+{
+	// reduce stage for halfP to 1
+	for (uint s = 1; s <= halfP; s <<= 1)
+	{
+		if ((id.x + 1) % (s * 2) == 0)
+		{
+			adresses[id.x] += adresses[id.x - s];
+		}
+		AllMemoryBarrierWithGroupSync();
+	}
+	if (id.x == 0)
+	{
+		adresses[(uint)_ParticlesCount - 1] = 0;
+		_Histogram[0] = 0;
+	}
+	AllMemoryBarrierWithGroupSync();
+}
+
+
+void downsweep(uint3 id, uint halfP)
+{
+	// downsweep stage for 1 to halfP
+	for (uint s = halfP; s >= 1; s >>= 1)
+	{
+		AllMemoryBarrierWithGroupSync();
+		if ((id.x + 1) % (s * 2) == 0)
+		{
+			uint ai = id.x;
+			uint bi = id.x - s;
+
+			uint temp = adresses[ai];
+			adresses[ai] += adresses[bi];
+			adresses[bi] = temp;
+		}
+	}
+	AllMemoryBarrierWithGroupSync();
+}
+
+
+void compact(uint3 id, uint bit, uint initAddr)
+{
+	// scan-in array by predicate
+	bool pred = (_ParticlesBufferIn[id.x].hash >> significantBit) & 1;
+	pred = pred ^ bit;
+	int hash = _ParticlesBufferIn[id.x].hash;
+	bool isLast = !(bool)(significantBit - 31);
+	predicates[id.x] = pred ^ isLast;
+
+	
+	// Exclusive Scan Sum (Blelloch alg)
+
+	adresses[id.x] = predicates[id.x]; // use shared array here
+	
+	
+	AllMemoryBarrierWithGroupSync();
+
+	uint halfP = (uint)_ParticlesCount * 0.5;
+
+	reduce(id, halfP);
+	
+	//downsweep(id, halfP);
+
+	// put particle according adress via swaping
+	if (predicates[id.x] == TRUE)
+	{
+		adresses[id.x] += initAddr * (bit ^ 1);
+
+		_ParticlesBufferOut[adresses[id.x]] = _ParticlesBufferIn[id.x];
+	
+		InterlockedAdd(add, predicates[id.x] * bit);
+	}
+}
+
+
+#pragma kernel radixSort
+[numthreads(THREADC_COUNT_X, 1, 1)]
+void radixSort(uint3 id : SV_DispatchThreadID)
+{
+	//InterlockedMin(initialAddress, 0u);
+	compact(id, 1, add);
+	AllMemoryBarrierWithGroupSync();
+	//compact(id, 0, add);
+}
+
+
+//void downsweep(uint3 id, uint halfP)
+//{
+//	// downsweep stage for 1 to halfP
+//	for (uint s = halfP; s >= 1; s >>= 1)
+//	{
+//		uint idCheck = id.x + 1;
+//		if (idCheck % (s * 2) == 0)
+//		{
+//			adresses[id.x] += adressesOld[id.x - s];
+//		}
+//		else if ((idCheck + s) % (s * 2) == 0)
+//		{
+//			adresses[id.x] = adressesOld[id.x + s];
+//		}
+//		AllMemoryBarrierWithGroupSync();
+//		adressesOld[id.x] = adresses[id.x];
+//		AllMemoryBarrierWithGroupSync();
+//	}
+//}

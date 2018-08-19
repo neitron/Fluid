@@ -1,0 +1,14 @@
+﻿
+RWStructuredBuffer<float3> _RWStructuredBuffer;
+
+groupshared uint t = 0;
+
+#pragma kernel Test
+[numthreads(8, 1, 1)]
+void Test(uint3 id : SV_DispatchThreadID)
+{
+	_RWStructuredBuffer[id.x]= id;
+	InterlockedAdd(t, 1);
+	
+	_RWStructuredBuffer[id.x].z = (float)t;
+}
